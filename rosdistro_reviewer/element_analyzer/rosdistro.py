@@ -1,7 +1,9 @@
 # Copyright 2026 Open Source Robotics Foundation, Inc.
 # Licensed under the Apache License, Version 2.0
 
+import calendar
 import copy
+import datetime
 from functools import lru_cache
 import itertools
 import json
@@ -553,11 +555,156 @@ def _check_maintainer_authorization(
     criteria.append(Criterion(recommendation, message))
 
 
+def _parse_eol_date(value: Any) -> Optional[datetime.date]:
+    if isinstance(value, datetime.datetime):
+        return None
+    if isinstance(value, datetime.date):
+        return value
+    if not isinstance(value, str):
+        return None
+    full_match = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', value)
+    if full_match:
+        year, month, day = map(int, full_match.groups())
+        try:
+            return datetime.date(year, month, day)
+        except ValueError:
+            return None
+    month_match = re.match(r'^(\d{4})-(\d{2})$', value)
+    if month_match:
+        year, month = map(int, month_match.groups())
+        if not 1 <= month <= 12:
+            return None
+        last_day = calendar.monthrange(year, month)[1]
+        return datetime.date(year, month, last_day)
+    return None
+
+
+def _check_eol_dates(
+    criteria: List[Criterion],
+    annotations: List[Annotation],
+    all_dist_files: Dict[str, List[str]],
+    all_changes: Dict[str, Any],
+) -> None:
+    index_data = all_changes.get('index-v4.yaml') or {}
+    distributions_map = index_data.get('distributions')
+    if not isinstance(distributions_map, dict):
+        return
+
+    eol_info: Dict[str, Tuple[Any, Optional[datetime.date], Any]] = {}
+    triggered = False
+    recommendation = Recommendation.APPROVE
+    problems: Set[str] = set()
+
+    for distro_name, dist_dict in distributions_map.items():
+        if not isinstance(dist_dict, dict):
+            continue
+        for k, v in dist_dict.items():
+            if k == 'distribution_eol_date':
+                eol_lines = (
+                    getattr(v, '__lines__', None) or
+                    getattr(k, '__lines__', None)
+                )
+                parsed_date = _parse_eol_date(v)
+                eol_info[str(distro_name)] = (v, parsed_date, eol_lines)
+                if eol_lines is not None:
+                    triggered = True
+                    if parsed_date is None:
+                        recommendation = Recommendation.DISAPPROVE
+                        problems.add(
+                            'Distribution EOL dates must use ISO 8601 format '
+                            '(YYYY-MM-DD or YYYY-MM)')
+                        annotations.append(Annotation(
+                            'index-v4.yaml',
+                            eol_lines,
+                            f"Invalid distribution_eol_date '{v}' for "
+                            f"'{distro_name}'; expected YYYY-MM-DD or YYYY-MM"
+                        ))
+                break
+
+    for distro_name, dist_files in all_dist_files.items():
+        for dist_file in dist_files:
+            dist_yaml = all_changes.get(dist_file)
+            if not isinstance(dist_yaml, dict):
+                continue
+            extends_list = dist_yaml.get('extends')
+            if not isinstance(extends_list, list):
+                continue
+            for item in extends_list:
+                parent_name: Optional[str] = None
+                item_lines: Any = None
+                if isinstance(item, str):
+                    parent_name = str(item)
+                    item_lines = getattr(item, '__lines__', None)
+                elif isinstance(item, dict):
+                    dist_val = item.get('distribution')
+                    if isinstance(dist_val, str):
+                        parent_name = str(dist_val)
+                        item_lines = (
+                            getattr(dist_val, '__lines__', None) or
+                            getattr(item, '__lines__', None)
+                        )
+                if not parent_name:
+                    continue
+
+                child_entry = eol_info.get(str(distro_name))
+                parent_entry = eol_info.get(parent_name)
+                child_eol_lines = child_entry[2] if child_entry else None
+                parent_eol_lines = parent_entry[2] if parent_entry else None
+
+                if (
+                    item_lines is not None or
+                    child_eol_lines is not None or
+                    parent_eol_lines is not None
+                ):
+                    triggered = True
+                    if child_entry and parent_entry:
+                        child_date = child_entry[1]
+                        parent_date = parent_entry[1]
+                        if (
+                            child_date is not None and
+                            parent_date is not None and
+                            parent_date < child_date
+                        ):
+                            recommendation = Recommendation.DISAPPROVE
+                            problems.add(
+                                'Extended parent distributions must not reach '
+                                'EOL before their child distributions')
+                            msg = (
+                                f"Parent distribution '{parent_name}' reaches "
+                                f'EOL ({parent_date}) before child '
+                                f"distribution '{distro_name}' ({child_date})"
+                            )
+                            if item_lines is not None:
+                                annotations.append(Annotation(
+                                    dist_file, item_lines, msg))
+                            if child_eol_lines is not None:
+                                annotations.append(Annotation(
+                                    'index-v4.yaml', child_eol_lines, msg))
+                            if parent_eol_lines is not None:
+                                annotations.append(Annotation(
+                                    'index-v4.yaml', parent_eol_lines, msg))
+
+    if not triggered:
+        return
+
+    if problems:
+        message = '\n- '.join([
+            'There are problems with distribution EOL dates:',
+        ] + sorted(problems))
+    else:
+        message = (
+            'Distribution EOL dates are valid and consistent with extended '
+            'distributions'
+        )
+
+    criteria.append(Criterion(recommendation, message))
+
+
 def _read_index(
     path: Path,
     target_ref: Optional[str] = None,
     head_ref: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[Tuple[Dict[str, Any], Dict[str, List[str]], Dict[str, Any]]]:
     # 1. Read the rosdistro index
     if head_ref is not None:
         with Repo(path) as repo:
@@ -592,19 +739,20 @@ def _read_index(
         for file in files
     }
 
-    # 3. Look for changes in each distribution file
+    # 3. Look for changes in index-v4.yaml and each distribution file
     all_dist_changes = get_changed_yaml(
-        path, list(unique_dist_files),
+        path, ['index-v4.yaml'] + list(unique_dist_files),
         target_ref=target_ref, head_ref=head_ref)
     if not all_dist_changes:
         return None
 
-    return {
+    full_index = {
         dist_name: {
             dist_file: all_dist_changes[dist_file].get('repositories') or []
             for dist_file in dist_files
         } for dist_name, dist_files in all_dist_files.items()
     }
+    return full_index, all_dist_files, dict(all_dist_changes)
 
 
 def _prune_index(changed_distros):
@@ -637,10 +785,11 @@ class RosdistroAnalyzer(ElementAnalyzerExtensionPoint):
         annotations: List[Annotation] = []
 
         # Read the full rosdistro index
-        full_index = _read_index(path, target_ref, head_ref)
-        if not full_index:
+        read_result = _read_index(path, target_ref, head_ref)
+        if not read_result:
             # Bypass check if no distros were changed
             return None, None
+        full_index, all_dist_files, all_changes = read_result
 
         # Re-structure the index by "entity" names (repo and package names).
         # This can be used by checks to correlate changes across distributions
@@ -661,11 +810,14 @@ class RosdistroAnalyzer(ElementAnalyzerExtensionPoint):
         # Prune the index down to only changed elements
         index = copy.deepcopy(full_index)
         _prune_index(index)
-        if not index:
-            # Bypass check if no distros were changed
-            return None, None
 
         logger.info('Performing analysis on ROS distribution changes...')
+
+        _check_eol_dates(criteria, annotations, all_dist_files, all_changes)
+
+        if not index and not criteria:
+            # Bypass check if no distros were changed
+            return None, None
 
         _check_repository_names(criteria, annotations, index, entities)
         _check_package_names(criteria, annotations, index, entities)

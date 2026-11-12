@@ -9,6 +9,7 @@ colcon
 committish
 connectionpool
 corge
+datetime
 debian
 deduplication
 deepcopy
@@ -45,6 +46,7 @@ login
 mantic
 metafunc
 mktemp
+monthrange
 mypy
 namedtuple
 noop
@@ -90,6 +92,7 @@ yakkety
 yaml
 yamllint
 yankee
+yyyy
 zulip
 zulipchat
 zulu

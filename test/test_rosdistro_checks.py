@@ -713,3 +713,81 @@ def test_rosdistro_syntax_error_in_git_ref(
     assert e.value.problem_mark is not None
     assert e.value.problem_mark.name == 'index-v4.yaml'
     assert e.value.problem_mark.line == 1
+
+
+def test_eol_dates_check(rosdistro_index_repo: Repo) -> None:
+    assert rosdistro_index_repo.working_tree_dir is not None
+    repo_dir = Path(rosdistro_index_repo.working_tree_dir)
+    extension = RosdistroAnalyzer()
+    index_path = repo_dir / 'index-v4.yaml'
+
+    # 1. Valid YYYY-MM-DD and YYYY-MM EOL dates on index-v4.yaml -> APPROVE
+    index_data = _generate_index(EXISTING_DISTROS.keys())
+    index_data['distributions']['jazzy']['distribution_eol_date'] = (
+        '2029-05-31'
+    )
+    index_data['distributions']['rolling']['distribution_eol_date'] = (
+        '2030-11'
+    )
+    with index_path.open('w') as f:
+        yaml.dump(index_data, f)
+
+    criteria, annotations = extension.analyze(repo_dir)
+    assert criteria is not None and not annotations
+    eol_c = [c for c in criteria if 'EOL' in c.rationale]
+    assert len(eol_c) == 1
+    assert eol_c[0].recommendation == Recommendation.APPROVE
+    # 2. Invalid EOL date format in index-v4.yaml -> DISAPPROVE + Annotation
+    index_data['distributions']['jazzy']['distribution_eol_date'] = (
+        '2029-13-45'
+    )
+    with index_path.open('w') as f:
+        yaml.dump(index_data, f)
+
+    criteria, annotations = extension.analyze(repo_dir)
+    assert criteria is not None and annotations
+    eol_c = [c for c in criteria if 'EOL' in c.rationale]
+    assert len(eol_c) == 1
+    assert eol_c[0].recommendation == Recommendation.DISAPPROVE
+    assert any(a.file == 'index-v4.yaml' for a in annotations)
+
+    # 3. Parent/Child EOL mismatch when child extends parent with earlier EOL
+    index_data['distributions']['jazzy']['distribution_eol_date'] = (
+        '2028-05-01'
+    )
+    index_data['distributions']['rolling']['distribution_eol_date'] = (
+        '2030-11-01'
+    )
+    with index_path.open('w') as f:
+        yaml.dump(index_data, f)
+    rosdistro_index_repo.index.add(str(index_path))
+    rosdistro_index_repo.index.commit('Set valid EOL dates on index')
+
+    rolling_path = repo_dir / 'rolling' / 'distribution.yaml'
+    with rolling_path.open('r') as f:
+        rolling_data = yaml.safe_load(f)
+    rolling_data['extends'] = [{'distribution': 'jazzy'}]
+    with rolling_path.open('w') as f:
+        yaml.dump(rolling_data, f)
+
+    criteria, annotations = extension.analyze(repo_dir)
+    assert criteria is not None and annotations
+    eol_c = [c for c in criteria if 'EOL' in c.rationale]
+    assert len(eol_c) == 1
+    assert eol_c[0].recommendation == Recommendation.DISAPPROVE
+    assert any(
+        a.file == str(Path('rolling/distribution.yaml')) for a in annotations
+    )
+
+    # 4. Parent EOL >= Child EOL -> APPROVE
+    index_data['distributions']['jazzy']['distribution_eol_date'] = (
+        '2032-05-01'
+    )
+    with index_path.open('w') as f:
+        yaml.dump(index_data, f)
+
+    criteria, annotations = extension.analyze(repo_dir)
+    assert criteria is not None and not annotations
+    eol_c = [c for c in criteria if 'EOL' in c.rationale]
+    assert len(eol_c) == 1
+    assert eol_c[0].recommendation == Recommendation.APPROVE
