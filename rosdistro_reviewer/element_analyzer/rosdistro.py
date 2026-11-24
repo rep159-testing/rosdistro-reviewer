@@ -1,7 +1,6 @@
 # Copyright 2026 Open Source Robotics Foundation, Inc.
 # Licensed under the Apache License, Version 2.0
 
-import calendar
 import copy
 import datetime
 from functools import lru_cache
@@ -569,13 +568,6 @@ def _parse_eol_date(value: Any) -> Optional[datetime.date]:
             return datetime.date(year, month, day)
         except ValueError:
             return None
-    month_match = re.match(r'^(\d{4})-(\d{2})$', value)
-    if month_match:
-        year, month = map(int, month_match.groups())
-        if not 1 <= month <= 12:
-            return None
-        last_day = calendar.monthrange(year, month)[1]
-        return datetime.date(year, month, last_day)
     return None
 
 
@@ -612,12 +604,12 @@ def _check_eol_dates(
                         recommendation = Recommendation.DISAPPROVE
                         problems.add(
                             'Distribution EOL dates must use ISO 8601 format '
-                            '(YYYY-MM-DD or YYYY-MM)')
+                            '(YYYY-MM-DD)')
                         annotations.append(Annotation(
                             'index-v4.yaml',
                             eol_lines,
                             f"Invalid distribution_eol_date '{v}' for "
-                            f"'{distro_name}'; expected YYYY-MM-DD or YYYY-MM"
+                            f"'{distro_name}'; expected YYYY-MM-DD"
                         ))
                 break
 
@@ -636,7 +628,9 @@ def _check_eol_dates(
                     parent_name = str(item)
                     item_lines = getattr(item, '__lines__', None)
                 elif isinstance(item, dict):
-                    dist_val = item.get('distribution')
+                    dist_val = (
+                        item.get('distro_name') or item.get('distribution')
+                    )
                     if isinstance(dist_val, str):
                         parent_name = str(dist_val)
                         item_lines = (
